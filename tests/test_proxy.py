@@ -1,0 +1,468 @@
+"""Tests for proxy URL parsing and credential extraction."""
+
+import asyncio
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from cloakbrowser.browser import (
+    _is_socks_proxy,
+    _resolve_proxy_config,
+    _warn_on_request_client_use,
+    maybe_resolve_geoip,
+)
+
+
+class TestBuildProxyKwargs:
+    """Tests for _resolve_proxy_config (formerly _build_proxy_kwargs) HTTP path."""
+
+    def test_none(self):
+        kwargs, args = _resolve_proxy_config(None)
+        assert kwargs == {}
+        assert args == []
+
+    def test_simple_proxy(self):
+        kwargs, args = _resolve_proxy_config("http://proxy:8080")
+        assert kwargs == {"proxy": {"server": "http://proxy:8080"}}
+        assert args == []
+
+    def test_proxy_with_auth(self, *_):
+        kwargs, args = _resolve_proxy_config("http://user:pass@proxy:8080")
+        assert kwargs == {}
+        assert args == ["--proxy-server=http://user:pass@proxy:8080"]
+
+    def test_proxy_dict_passthrough(self):
+        proxy_dict = {"server": "http://proxy:8080", "bypass": ".google.com,localhost"}
+        kwargs, args = _resolve_proxy_config(proxy_dict)
+        assert kwargs == {"proxy": proxy_dict}
+        assert args == []
+
+    def test_proxy_dict_with_auth(self, *_):
+        proxy_dict = {
+            "server": "http://proxy:8080",
+            "username": "user",
+            "password": "pass",
+            "bypass": ".example.com",
+        }
+        kwargs, args = _resolve_proxy_config(proxy_dict)
+        assert kwargs == {}
+        assert args == [
+            "--proxy-server=http://user:pass@proxy:8080",
+            "--proxy-bypass-list=.example.com",
+        ]
+
+
+class TestMaybeResolveGeoip:
+    @patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip", return_value=("America/New_York", "en-US", "1.2.3.4"))
+    def test_geoip_with_string_proxy(self, mock_geo):
+        tz, locale, ip = maybe_resolve_geoip(True, "http://proxy:8080", None, None)
+        mock_geo.assert_called_once_with("http://proxy:8080")
+        assert tz == "America/New_York"
+        assert locale == "en-US"
+        assert ip == "1.2.3.4"
+
+    @patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip", return_value=("Europe/London", "en-GB", "5.6.7.8"))
+    def test_geoip_with_dict_proxy_extracts_server(self, mock_geo):
+        proxy_dict = {"server": "http://proxy:8080", "bypass": ".google.com"}
+        tz, locale, ip = maybe_resolve_geoip(True, proxy_dict, None, None)
+        mock_geo.assert_called_once_with("http://proxy:8080")
+        assert tz == "Europe/London"
+        assert locale == "en-GB"
+
+    def test_geoip_disabled_skips_resolution(self):
+        tz, locale, ip = maybe_resolve_geoip(False, "http://proxy:8080", None, None)
+        assert tz is None
+        assert locale is None
+        assert ip is None
+
+    @patch(
+        "cloakbrowser.geoip.resolve_proxy_geo_with_ip",
+        return_value=("America/New_York", "en-US", "1.2.3.4"),
+    )
+    def test_geoip_no_proxy_uses_machine_ip(self, mock_geo):
+        # No proxy → resolve the machine's own public IP (proxy_url=None).
+        tz, locale, ip = maybe_resolve_geoip(True, None, None, None)
+        mock_geo.assert_called_once_with(None)
+        assert tz == "America/New_York"
+        assert locale == "en-US"
+        assert ip == "1.2.3.4"
+
+    @patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip", return_value=("Asia/Tokyo", "ja-JP", "9.8.7.6"))
+    def test_geoip_preserves_explicit_timezone(self, mock_geo):
+        tz, locale, _ip = maybe_resolve_geoip(True, "http://proxy:8080", "Europe/Berlin", None)
+        assert tz == "Europe/Berlin"
+        assert locale == "ja-JP"
+
+    @patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip", return_value=("America/New_York", "en-US", "1.2.3.4"))
+    def test_geoip_normalizes_bare_proxy_with_creds(self, mock_geo):
+        # "user:pass@host:port" must be normalized to http:// before geoip lookup.
+        tz, locale, _ip = maybe_resolve_geoip(True, "user:pass@proxy:8080", None, None)
+        mock_geo.assert_called_once_with("http://user:pass@proxy:8080")
+        assert tz == "America/New_York"
+        assert locale == "en-US"
+
+    @patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip", return_value=("America/New_York", "en-US", "1.2.3.4"))
+    def test_geoip_normalizes_schemeless_proxy_no_creds(self, mock_geo):
+        # "host:port" (no @ and no scheme) must also be normalized.
+        tz, locale, _ip = maybe_resolve_geoip(True, "proxy:8080", None, None)
+        mock_geo.assert_called_once_with("http://proxy:8080")
+        assert tz == "America/New_York"
+
+    @patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip", return_value=("Europe/Berlin", "de-DE", "5.6.7.8"))
+    def test_geoip_socks5_dict_reconstructs_credentials(self, mock_geo):
+        proxy_dict = {"server": "socks5://proxy:1080", "username": "user", "password": "pass"}
+        tz, locale, ip = maybe_resolve_geoip(True, proxy_dict, None, None)
+        mock_geo.assert_called_once_with("socks5://user:pass@proxy:1080")
+        assert tz == "Europe/Berlin"
+        assert locale == "de-DE"
+
+    @patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip", return_value=("Europe/Berlin", "de-DE", "5.6.7.8"))
+    def test_geoip_socks5_dict_no_auth_uses_server(self, mock_geo):
+        proxy_dict = {"server": "socks5://proxy:1080"}
+        tz, locale, ip = maybe_resolve_geoip(True, proxy_dict, None, None)
+        mock_geo.assert_called_once_with("socks5://proxy:1080")
+
+    @patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip", return_value=("Europe/London", "en-GB", "1.1.1.1"))
+    def test_geoip_http_dict_without_credentials_uses_server(self, mock_geo):
+        proxy_dict = {"server": "http://proxy:8080"}
+        tz, locale, ip = maybe_resolve_geoip(True, proxy_dict, None, None)
+        mock_geo.assert_called_once_with("http://proxy:8080")
+
+    @patch("cloakbrowser.geoip.resolve_proxy_geo_with_ip", return_value=("Europe/London", "en-GB", "1.1.1.1"))
+    def test_geoip_http_dict_reconstructs_credentials(self, mock_geo):
+        proxy_dict = {"server": "http://proxy:8080", "username": "user", "password": "pass"}
+        tz, locale, ip = maybe_resolve_geoip(True, proxy_dict, None, None)
+        mock_geo.assert_called_once_with("http://user:pass@proxy:8080")
+
+
+class TestBareProxyFormat:
+    """Bare proxy strings (no scheme)."""
+
+    def test_bare_no_credentials_passthrough(self):
+        # "host:port" without @ — no scheme, no creds — pass through unchanged
+        assert _resolve_proxy_config("proxy:8080") == ({"proxy": {"server": "proxy:8080"}}, [])
+
+    def test_resolve_proxy_config_bare(self, *_):
+        kwargs, args = _resolve_proxy_config("user:pass@proxy:8080")
+        assert kwargs == {}
+        assert args == ["--proxy-server=http://user:pass@proxy:8080"]
+
+
+class TestIsSocksProxy:
+    def test_socks5_string(self):
+        assert _is_socks_proxy("socks5://user:pass@host:1080") is True
+
+    def test_socks5h_string(self):
+        assert _is_socks_proxy("socks5h://host:1080") is True
+
+    def test_socks5_uppercase(self):
+        assert _is_socks_proxy("SOCKS5://host:1080") is True
+
+    def test_http_string(self):
+        assert _is_socks_proxy("http://host:8080") is False
+
+    def test_dict_socks5(self):
+        assert _is_socks_proxy({"server": "socks5://host:1080"}) is True
+
+    def test_dict_http(self):
+        assert _is_socks_proxy({"server": "http://host:8080"}) is False
+
+    def test_none(self):
+        assert _is_socks_proxy(None) is False
+
+
+class TestResolveProxyConfig:
+    def test_none(self):
+        kwargs, args = _resolve_proxy_config(None)
+        assert kwargs == {}
+        assert args == []
+
+    def test_http_string_with_creds_returns_chrome_arg(self, *_):
+        kwargs, args = _resolve_proxy_config("http://user:pass@proxy:8080")
+        assert kwargs == {}
+        assert args == ["--proxy-server=http://user:pass@proxy:8080"]
+
+    def test_http_string_no_creds_returns_playwright_dict(self):
+        kwargs, args = _resolve_proxy_config("http://proxy:8080")
+        assert "proxy" in kwargs
+        assert kwargs["proxy"]["server"] == "http://proxy:8080"
+        assert args == []
+
+    def test_http_dict_passthrough(self):
+        proxy = {"server": "http://proxy:8080", "bypass": ".example.com"}
+        kwargs, args = _resolve_proxy_config(proxy)
+        assert kwargs == {"proxy": proxy}
+        assert args == []
+
+    def test_socks5_string_returns_chrome_arg(self):
+        kwargs, args = _resolve_proxy_config("socks5://user:pass@host:1080")
+        assert kwargs == {}
+        assert args == ["--proxy-server=socks5://user:pass@host:1080"]
+
+    def test_socks5_no_auth_returns_chrome_arg(self):
+        kwargs, args = _resolve_proxy_config("socks5://host:1080")
+        assert kwargs == {}
+        assert args == ["--proxy-server=socks5://host:1080"]
+
+    def test_socks5h_returns_chrome_arg(self):
+        kwargs, args = _resolve_proxy_config("socks5h://user:pass@host:1080")
+        assert kwargs == {}
+        assert args == ["--proxy-server=socks5h://user:pass@host:1080"]
+
+    def test_socks5_dict_reconstructs_url(self):
+        proxy = {"server": "socks5://host:1080", "username": "user", "password": "p@ss"}
+        kwargs, args = _resolve_proxy_config(proxy)
+        assert kwargs == {}
+        assert len(args) == 1
+        assert args[0].startswith("--proxy-server=socks5://user:p%40ss@host:1080")
+
+    def test_socks5_dict_ipv6_preserves_brackets(self):
+        proxy = {"server": "socks5://[::1]:1080", "username": "user", "password": "pass"}
+        kwargs, args = _resolve_proxy_config(proxy)
+        assert kwargs == {}
+        assert "[::1]" in args[0]
+
+    def test_socks5_dict_with_bypass(self):
+        proxy = {"server": "socks5://host:1080", "bypass": ".example.com"}
+        kwargs, args = _resolve_proxy_config(proxy)
+        assert kwargs == {}
+        assert "--proxy-server=socks5://host:1080" in args
+        assert "--proxy-bypass-list=.example.com" in args
+
+    def test_socks5_string_encodes_equals_in_password(self):
+        # Chromium's --proxy-server parser truncates passwords at '=' (#157).
+        # Wrapper must auto URL-encode before passing to Chrome.
+        _, args = _resolve_proxy_config("socks5://user:pass=123@host:1080")
+        assert args == ["--proxy-server=socks5://user:pass%3D123@host:1080"]
+
+    def test_socks5_string_encodes_at_in_password(self):
+        _, args = _resolve_proxy_config("socks5://user:p@ss@host:1080")
+        # Note: parsing "user:p@ss@host" — urlparse takes everything up to LAST @
+        # as userinfo, so password = "p@ss".
+        assert args == ["--proxy-server=socks5://user:p%40ss@host:1080"]
+
+    def test_socks5_string_encoding_idempotent(self):
+        # Already-encoded input should remain encoded (not double-encoded).
+        _, args = _resolve_proxy_config("socks5://user:pass%3D123@host:1080")
+        assert args == ["--proxy-server=socks5://user:pass%3D123@host:1080"]
+
+    def test_socks5_string_logs_info_when_reencoding(self, caplog):
+        # When wrapper actually rewrites the URL (e.g. unencoded '=' in pwd),
+        # surface an INFO log so users debugging SOCKS5 connectivity (#157)
+        # can see what the wrapper did instead of being silently surprised.
+        import logging
+        with caplog.at_level(logging.INFO, logger="cloakbrowser"):
+            _resolve_proxy_config("socks5://user:pass=123@host:1080")
+        assert any("Auto URL-encoded SOCKS5" in r.message for r in caplog.records)
+        # Credentials must not leak into the log.
+        for r in caplog.records:
+            assert "pass=123" not in r.message
+            assert "pass%3D123" not in r.message
+
+    def test_socks5_string_silent_when_already_encoded(self, caplog):
+        # Idempotent path: pre-encoded URL produces no log noise.
+        import logging
+        with caplog.at_level(logging.INFO, logger="cloakbrowser"):
+            _resolve_proxy_config("socks5://user:pass%3D123@host:1080")
+        assert not any("Auto URL-encoded SOCKS5" in r.message for r in caplog.records)
+
+    def test_socks5_string_silent_when_no_credentials(self, caplog):
+        # No userinfo at all → no encoding work → no log.
+        import logging
+        with caplog.at_level(logging.INFO, logger="cloakbrowser"):
+            _resolve_proxy_config("socks5://host:1080")
+        assert not any("Auto URL-encoded SOCKS5" in r.message for r in caplog.records)
+
+    def test_socks5_string_silent_when_only_cosmetic_change(self, caplog):
+        # urlparse lowercases scheme and hostname, but credentials are
+        # untouched. The log must NOT fire for these cosmetic-only rewrites
+        # (regression for Copilot's review on PR #209).
+        import logging
+        with caplog.at_level(logging.INFO, logger="cloakbrowser"):
+            _resolve_proxy_config("socks5://USER:pass@HOST.com:1080")
+        assert not any("Auto URL-encoded SOCKS5" in r.message for r in caplog.records)
+
+    def test_socks5_string_no_creds_unchanged(self):
+        _, args = _resolve_proxy_config("socks5://host:1080")
+        assert args == ["--proxy-server=socks5://host:1080"]
+
+    def test_socks5_string_password_only_still_encoded(self):
+        # Empty username with password: fix must still re-encode the password
+        # (regression test for empty-username bypass).
+        _, args = _resolve_proxy_config("socks5://:pass=123@host:1080")
+        assert args == ["--proxy-server=socks5://:pass%3D123@host:1080"]
+
+    def test_socks5_string_empty_password_preserves_colon(self):
+        # `user:@host` (empty password) must NOT collapse to `user@host` —
+        # semantics differ between the two forms.
+        _, args = _resolve_proxy_config("socks5://user:@host:1080")
+        assert args == ["--proxy-server=socks5://user:@host:1080"]
+
+    def test_socks5_string_literal_percent_in_password(self):
+        # Literal '%' not followed by 2 hex digits must be encoded as '%25'
+        # so Chrome decodes it back to '%'. Must not crash.
+        _, args = _resolve_proxy_config("socks5://user:100%sure@host:1080")
+        assert args == ["--proxy-server=socks5://user:100%25sure@host:1080"]
+
+    def test_socks5_string_malformed_port_passes_through(self, caplog):
+        # Invalid port (non-numeric) raises in urlparse.port. Wrapper should
+        # log a warning and pass original through to Chromium.
+        import logging
+        with caplog.at_level(logging.WARNING, logger="cloakbrowser"):
+            _, args = _resolve_proxy_config("socks5://user:pass@host:abc")
+        assert args == ["--proxy-server=socks5://user:pass@host:abc"]
+        assert any("Malformed SOCKS5" in r.message for r in caplog.records)
+
+    def test_socks5_string_malformed_ipv6_passes_through(self, caplog):
+        # Broken IPv6 bracket — must not crash, and must reach Chromium
+        # verbatim so its own error surfaces instead of a silent rewrite.
+        import logging
+        with caplog.at_level(logging.WARNING, logger="cloakbrowser"):
+            _, args = _resolve_proxy_config("socks5://user:pass@[::1")
+        assert args == ["--proxy-server=socks5://user:pass@[::1"]
+
+    def test_socks5_string_preserves_path_and_query(self):
+        # Nonstandard for SOCKS5, but don't silently drop user-supplied suffixes.
+        # Matches JS behavior.
+        _, args = _resolve_proxy_config("socks5://user:pass@host:1080/p?x=1#f")
+        assert args[0] == "--proxy-server=socks5://user:pass@host:1080/p?x=1#f"
+
+    def test_socks5_string_ipv6_with_special_char_password(self):
+        # IPv6 host + special char in password — both must be handled.
+        _, args = _resolve_proxy_config("socks5://user:pass=eq@[::1]:1080")
+        assert args[0] == "--proxy-server=socks5://user:pass%3Deq@[::1]:1080"
+
+    def test_socks5_string_port_zero_preserved(self):
+        # Port 0 is an unusual but valid URL component; don't silently strip it.
+        _, args = _resolve_proxy_config("socks5://user:pass=1@host:0")
+        assert args[0] == "--proxy-server=socks5://user:pass%3D1@host:0"
+
+    # --- HTTP with credentials → --proxy-server ---
+
+    def test_http_string_with_creds(self):
+        kwargs, args = _resolve_proxy_config("http://user:pass@proxy:8080")
+        assert kwargs == {}
+        assert args == ["--proxy-server=http://user:pass@proxy:8080"]
+
+    def test_http_dict_with_creds(self):
+        proxy = {"server": "http://proxy:8080", "username": "user", "password": "pass"}
+        kwargs, args = _resolve_proxy_config(proxy)
+        assert kwargs == {}
+        assert args == ["--proxy-server=http://user:pass@proxy:8080"]
+
+    def test_http_dict_with_creds_and_bypass(self):
+        proxy = {
+            "server": "http://proxy:8080",
+            "username": "user",
+            "password": "pass",
+            "bypass": ".google.com",
+        }
+        kwargs, args = _resolve_proxy_config(proxy)
+        assert kwargs == {}
+        assert "--proxy-server=http://user:pass@proxy:8080" in args
+        assert "--proxy-bypass-list=.google.com" in args
+
+    def test_http_string_encodes_special_chars_in_password(self, *_):
+        _, args = _resolve_proxy_config("http://user:pass=123@proxy:8080")
+        assert args == ["--proxy-server=http://user:pass%3D123@proxy:8080"]
+
+    def test_http_string_encoding_idempotent(self, *_):
+        _, args = _resolve_proxy_config("http://user:pass%3D123@proxy:8080")
+        assert args == ["--proxy-server=http://user:pass%3D123@proxy:8080"]
+
+    @pytest.mark.parametrize(
+        "tag", ["linux-x64", "linux-arm64", "darwin-arm64", "darwin-x64", "windows-x64"]
+    )
+    def test_http_with_creds_inline_on_every_platform(self, tag):
+        # Every served build ships inline proxy auth: no platform falls back to
+        # Playwright's CDP proxy dict, an unversioned local override included.
+        with patch("cloakbrowser.config.get_platform_tag", return_value=tag), \
+                patch.dict("os.environ", {"CLOAKBROWSER_BINARY_PATH": "/x/chrome"}):
+            kwargs, args = _resolve_proxy_config("http://user:pass@proxy:8080")
+        assert kwargs == {}
+        assert args == ["--proxy-server=http://user:pass@proxy:8080"]
+
+    # --- HTTP without credentials (all platforms) ---
+
+    def test_http_no_creds_returns_playwright_dict(self):
+        kwargs, args = _resolve_proxy_config("http://proxy:8080")
+        assert "proxy" in kwargs
+        assert args == []
+
+    def test_http_dict_no_creds_returns_playwright_dict(self):
+        proxy = {"server": "http://proxy:8080", "bypass": ".example.com"}
+        kwargs, args = _resolve_proxy_config(proxy)
+        assert kwargs == {"proxy": proxy}
+        assert args == []
+
+
+class _FakeRequest:
+    """Stands in for playwright's impl APIRequestContext (method on the class)."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def _inner_fetch(self, *args, **kwargs):
+        self.calls += 1
+        return "ok"
+
+
+class _FakeContext:
+    def __init__(self, options=None):
+        self._options = options or {}
+        self._request = _FakeRequest()
+
+
+class TestRequestClientProxyWarning:
+    """#579: Playwright's request client skips a proxy passed as --proxy-server."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_flag(self):
+        import cloakbrowser.browser as browser_mod
+        browser_mod._request_proxy_warned = False
+        yield
+        browser_mod._request_proxy_warned = False
+
+    def test_warns_once_on_first_use(self, capsys):
+        ctx = _FakeContext()
+        _warn_on_request_client_use(ctx)
+        assert "context.request" not in capsys.readouterr().err  # nothing until used
+
+        asyncio.run(ctx._request._inner_fetch(None, "https://x"))
+        asyncio.run(ctx._request._inner_fetch(None, "https://x"))
+        assert ctx._request.calls == 2
+        assert capsys.readouterr().err.count("context.request") == 1
+
+    def test_per_context_proxy_does_not_warn(self, capsys):
+        ctx = _FakeContext({"proxy": {"server": "http://ctx-proxy:8080"}})
+        _warn_on_request_client_use(ctx)
+        asyncio.run(ctx._request._inner_fetch(None, "https://x"))
+        assert "context.request" not in capsys.readouterr().err
+
+    @pytest.mark.parametrize("proxy,hooked", [("socks5://u:p@h:1080", True), ("http://proxy:8080", False)])
+    @patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
+    @patch("cloakbrowser.browser.maybe_resolve_geoip", return_value=(None, None, None))
+    def test_launch_hooks_only_flag_path(self, _geoip, _bin, proxy, hooked):
+        pw_cm = MagicMock()
+        browser = pw_cm.start.return_value.chromium.launch.return_value
+        with patch("playwright.sync_api.sync_playwright", return_value=pw_cm):
+            from cloakbrowser.browser import launch
+            launch(proxy=proxy)
+        calls = [c for c in browser._impl_obj.on.call_args_list if c.args == ("context", _warn_on_request_client_use)]
+        assert bool(calls) is hooked
+
+    @pytest.mark.parametrize("proxy,hooked", [("socks5://u:p@h:1080", True), ("http://proxy:8080", False)])
+    @patch("cloakbrowser.browser.ensure_binary", return_value="/fake/chrome")
+    @patch("cloakbrowser.browser.maybe_resolve_geoip", return_value=(None, None, None))
+    @patch("cloakbrowser.browser.persistent_seed_args", side_effect=lambda _d, _s, a: a)
+    def test_persistent_hooks_only_flag_path(self, _seed, _geoip, _bin, proxy, hooked):
+        pw_cm = MagicMock()
+        context = pw_cm.start.return_value.chromium.launch_persistent_context.return_value
+        with patch("playwright.sync_api.sync_playwright", return_value=pw_cm), \
+                patch("cloakbrowser.browser._warn_on_request_client_use") as hook:
+            from cloakbrowser.browser import launch_persistent_context
+            launch_persistent_context("/tmp/profile", proxy=proxy)
+        if hooked:
+            hook.assert_called_once_with(context._impl_obj)
+        else:
+            hook.assert_not_called()

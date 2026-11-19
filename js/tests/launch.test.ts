@@ -1,0 +1,808 @@
+import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
+import { binaryInfo } from "../src/download.js";
+import { getBinaryPath, getPlatformTag } from "../src/config.js";
+
+describe("binaryInfo", () => {
+  it("returns correct structure (nothing cached yet)", () => {
+    const orig = process.env.CLOAKBROWSER_CACHE_DIR;
+    process.env.CLOAKBROWSER_CACHE_DIR = `/tmp/cloakbrowser-test-${Date.now()}`;
+    try {
+      const info = binaryInfo();
+
+      expect(info.version).toBeNull();
+      expect(info.platform).toMatch(/^(linux|darwin|windows)-(x64|arm64)$/);
+      expect(info.binaryPath).toBeNull();
+      expect(info.installed).toBe(false);
+      expect(info.downloadUrl).toMatch(/\/api\/download\/latest$/);
+    } finally {
+      if (orig) process.env.CLOAKBROWSER_CACHE_DIR = orig;
+      else delete process.env.CLOAKBROWSER_CACHE_DIR;
+    }
+  });
+
+  it("reports the installed binary, not a cached license", () => {
+    // A valid, fresh license is cached but NO binary is on disk.
+    const orig = process.env.CLOAKBROWSER_CACHE_DIR;
+    const dir = `/tmp/cloakbrowser-test-${Date.now()}-tier`;
+    fs.mkdirSync(dir, { recursive: true });
+    process.env.CLOAKBROWSER_CACHE_DIR = dir;
+    try {
+      fs.writeFileSync(
+        path.join(dir, ".license_cache"),
+        JSON.stringify({
+          key_sha256: "abc",
+          valid: true,
+          plan: "solo",
+          expires: null,
+          validated_at: Date.now() / 1000,
+        })
+      );
+      expect(binaryInfo().installed).toBe(false);
+
+      // Now drop a binary on disk.
+      fs.writeFileSync(path.join(dir, `latest_pro_version_${getPlatformTag()}`), "147.0.5555.1");
+      const bp = getBinaryPath("147.0.5555.1");
+      fs.mkdirSync(path.dirname(bp), { recursive: true });
+      fs.writeFileSync(bp, "fake");
+      fs.chmodSync(bp, 0o755);
+      const info = binaryInfo();
+      expect(info.installed).toBe(true);
+      expect(info.version).toBe("147.0.5555.1");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (orig) process.env.CLOAKBROWSER_CACHE_DIR = orig;
+      else delete process.env.CLOAKBROWSER_CACHE_DIR;
+    }
+  });
+
+  it("threads the channel into the Pro download URL", () => {
+    const orig = process.env.CLOAKBROWSER_CACHE_DIR;
+    const dir = `/tmp/cloakbrowser-test-${Date.now()}-chan`;
+    fs.mkdirSync(dir, { recursive: true });
+    process.env.CLOAKBROWSER_CACHE_DIR = dir;
+    try {
+      // Same cached Pro binary satisfies both channels (version-keyed cache dir).
+      fs.writeFileSync(path.join(dir, `latest_pro_version_preview_${getPlatformTag()}`), "151.0.7900.10.1");
+      fs.writeFileSync(path.join(dir, `latest_pro_version_${getPlatformTag()}`), "151.0.7900.10.1");
+      const bp = getBinaryPath("151.0.7900.10.1");
+      fs.mkdirSync(path.dirname(bp), { recursive: true });
+      fs.writeFileSync(bp, "fake");
+      fs.chmodSync(bp, 0o755);
+
+      expect(binaryInfo(undefined, "preview").downloadUrl).toMatch(/\/api\/download\/latest\?channel=preview$/);
+      const stableUrl = binaryInfo(undefined, "stable").downloadUrl;
+      expect(stableUrl).toMatch(/\/api\/download\/latest$/);
+      expect(stableUrl).not.toContain("channel=preview");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+      if (orig) process.env.CLOAKBROWSER_CACHE_DIR = orig;
+      else delete process.env.CLOAKBROWSER_CACHE_DIR;
+    }
+  });
+});
+
+describe("composable Playwright launch helpers", () => {
+  const origBinaryPath = process.env.CLOAKBROWSER_BINARY_PATH;
+
+  beforeEach(() => {
+    process.env.CLOAKBROWSER_BINARY_PATH = "/fake/chrome";
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.resetModules();
+    if (origBinaryPath) {
+      process.env.CLOAKBROWSER_BINARY_PATH = origBinaryPath;
+    } else {
+      delete process.env.CLOAKBROWSER_BINARY_PATH;
+    }
+  });
+
+  it("forwards releaseChannel to Playwright binary resolution", async () => {
+    delete process.env.CLOAKBROWSER_BINARY_PATH;
+    const ensureBinary = vi.fn().mockResolvedValue("/fake/chrome");
+    vi.doMock("../src/download.js", () => ({ ensureBinary }));
+    try {
+      const { buildLaunchOptions } = await import("../src/playwright.js");
+
+      await buildLaunchOptions({ releaseChannel: "preview" });
+
+      expect(ensureBinary).toHaveBeenCalledWith(undefined, undefined, "preview");
+    } finally {
+      vi.doUnmock("../src/download.js");
+    }
+  });
+
+  it("exports composable helpers from the package entrypoint", async () => {
+    const entry = await import("../src/index.js");
+
+    expect(entry.buildLaunchOptions).toBeTypeOf("function");
+    expect(entry.buildContextOptions).toBeTypeOf("function");
+    expect(entry.humanizeBrowser).toBeTypeOf("function");
+    expect(entry.guardBrowser).toBeTypeOf("function");
+    expect(entry.licenseErrorFrom).toBeTypeOf("function");
+    expect(entry.licenseDenial).toBeTypeOf("function");
+  });
+
+  it("buildContextOptions returns Playwright context options without launching a browser", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { buildContextOptions } = await import("../src/index.js");
+
+    const options = buildContextOptions({
+      userAgent: "Explicit/1.0",
+      viewport: { width: 1280, height: 720 },
+      colorScheme: "dark",
+      contextOptions: {
+        userAgent: "Context/9.9",
+        viewport: { width: 9999, height: 9999 },
+        colorScheme: "light",
+        storageState: "state.json",
+        locale: "de-DE",
+        timezoneId: "Europe/Berlin",
+      },
+    });
+
+    expect(options).toMatchObject({
+      userAgent: "Explicit/1.0",
+      viewport: { width: 1280, height: 720 },
+      colorScheme: "dark",
+      storageState: "state.json",
+    });
+    expect(options.locale).toBeUndefined();
+    expect(options.timezoneId).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("buildContextOptions uses no viewport (null) by default, headed or headless", async () => {
+    const { buildContextOptions } = await import("../src/index.js");
+
+    // Headed: CDP emulation would force outerWidth < innerWidth; headless: the
+    // binary reports coherent dimensions itself.
+    expect(buildContextOptions().viewport).toBeNull();
+    expect(buildContextOptions({ headless: false }).viewport).toBeNull();
+    expect(buildContextOptions({ headless: true }).viewport).toBeNull();
+    expect(buildContextOptions({ launchOptions: { headless: true } }).viewport).toBeNull();
+    // Explicit viewport always honored.
+    const custom = { width: 800, height: 600 };
+    expect(buildContextOptions({ headless: false, viewport: custom }).viewport).toEqual(custom);
+    expect(buildContextOptions({ viewport: null }).viewport).toBeNull();
+  });
+
+  it("buildLaunchOptions returns Playwright options without launching a browser", async () => {
+    const { buildLaunchOptions } = await import("../src/index.js");
+
+    const options = await buildLaunchOptions({
+      headless: false,
+      proxy: "http://user:pass@proxy.example:8080",
+      args: ["--custom-flag"],
+      launchOptions: { timeout: 1234 },
+    });
+
+    expect(options.executablePath).toBe("/fake/chrome");
+    expect(options.headless).toBe(false);
+    expect(options.args).toContain("--custom-flag");
+    expect(options.ignoreDefaultArgs).toContain("--enable-automation");
+    // Credentialed HTTP proxy goes inline (every served build ships inline auth).
+    expect(options.proxy).toBeUndefined();
+    expect(options.args).toContain("--proxy-server=http://user:pass@proxy.example:8080");
+    expect(options.timeout).toBe(1234);
+    // No license key -> env is not injected
+    expect(options.env).toBeUndefined();
+  });
+
+  it("buildLaunchOptions injects env with license key", async () => {
+    const { buildLaunchOptions } = await import("../src/index.js");
+
+    const options = await buildLaunchOptions({
+      licenseKey: "cb_test_key",
+      launchOptions: { timeout: 1234 },
+    });
+
+    expect(options.env).toBeDefined();
+    expect(options.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_test_key");
+    // Standalone call still gets a denial file for guardBrowser()
+    expect(options.env!.CLOAKBROWSER_LICENSE_STATUS_FILE).toMatch(/denials/);
+    // launchOptions timeout still forwarded
+    expect(options.timeout).toBe(1234);
+  });
+
+  it("guardBrowser turns a denial into CloakBrowserLicenseError", async () => {
+    const { guardBrowser, CloakBrowserLicenseError } = await import("../src/index.js");
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+
+    const denial = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cb-")), "d.json");
+    fs.writeFileSync(denial, "77");
+    const browser: any = {
+      newPage: async () => {
+        throw new Error("Target page, context or browser has been closed");
+      },
+    };
+    guardBrowser(browser, { env: { CLOAKBROWSER_LICENSE_STATUS_FILE: denial } });
+
+    expect(browser.__cloakDenialPath).toBe(denial);
+    await expect(browser.newPage()).rejects.toBeInstanceOf(CloakBrowserLicenseError);
+  });
+
+  it("licenseDenial checks the stashed denial file without a browser call", async () => {
+    const { licenseDenial, CloakBrowserLicenseError } = await import("../src/index.js");
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+
+    const denial = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cb-")), "d.json");
+    const ctx: any = {};
+    expect(licenseDenial(ctx)).toBeNull(); // nothing stashed
+    ctx.__cloakDenialPath = denial;
+    expect(licenseDenial(ctx)).toBeNull(); // no file yet
+    fs.writeFileSync(denial, "76");
+    expect(licenseDenial(ctx)).toBeInstanceOf(CloakBrowserLicenseError);
+    expect(licenseDenial(ctx)).toBeInstanceOf(CloakBrowserLicenseError); // cached after read
+  });
+
+  it("guard leaves close() and isClosed() alone after a denial", async () => {
+    // Playwright's BrowserContext.close() calls page.isClosed() internally; guarding
+    // it made close() throw the license error and abort teardown.
+    const { installLicenseGuard } = await import("../src/license.js");
+    const fs = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+
+    const denial = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "cb-")), "d.json");
+    fs.writeFileSync(denial, "76");
+    const page: any = { isClosed: () => false, close: async () => "closed", goto: async () => "ok" };
+    installLicenseGuard(page, denial);
+
+    expect(page.isClosed()).toBe(false);
+    await expect(page.close()).resolves.toBe("closed");
+    await expect(page.goto()).rejects.toThrow(/session limit/);
+
+    // Puppeteer: Browser.close() ends with disconnect().
+    const browser: any = { disconnect: async () => "gone", process: () => null, newPage: async () => ({}) };
+    installLicenseGuard(browser, denial);
+    await expect(browser.disconnect()).resolves.toBe("gone");
+    expect(browser.process()).toBeNull();
+    await expect(browser.newPage()).rejects.toThrow(/session limit/);
+  });
+
+  it("guardBrowser is a no-op without a license", async () => {
+    const { guardBrowser } = await import("../src/index.js");
+    const newPage = async () => "page";
+    const browser: any = { newPage };
+    guardBrowser(browser, { executablePath: "/fake/chrome" });
+    expect(browser.newPage).toBe(newPage);
+  });
+
+  it("buildLaunchOptions preserves custom env via launchOptions", async () => {
+    const { buildLaunchOptions } = await import("../src/index.js");
+
+    const options = await buildLaunchOptions({
+      licenseKey: "cb_key",
+      launchOptions: {
+        timeout: 1234,
+        env: { MY_VAR: "custom" },
+      },
+    });
+
+    expect(options.env).toBeDefined();
+    // Custom env var preserved
+    expect(options.env!.MY_VAR).toBe("custom");
+    // License key injected
+    expect(options.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_key");
+  });
+
+  it("humanizeBrowser patches an existing browser only when requested", async () => {
+    const { humanizeBrowser } = await import("../src/index.js");
+    const browser = {
+      contexts: () => [],
+      newContext: vi.fn(async () => ({})),
+      newPage: vi.fn(async () => ({ context: () => ({}) })),
+    };
+    const originalNewContext = browser.newContext;
+
+    await humanizeBrowser(browser as any, { humanize: false });
+    expect(browser.newContext).toBe(originalNewContext);
+
+    await humanizeBrowser(browser as any, { humanize: true });
+    expect(browser.newContext).not.toBe(originalNewContext);
+  });
+});
+
+// Integration tests require the binary — run with:
+//   CLOAKBROWSER_BINARY_PATH=/path/to/chrome npm test
+describe.skipIf(!process.env.CLOAKBROWSER_BINARY_PATH)(
+  "launch (integration)",
+  () => {
+    it("launches browser and checks stealth", async () => {
+      const { launch } = await import("../src/playwright.js");
+
+      const browser = await launch({ headless: true });
+      const page = await browser.newPage();
+      await page.goto("about:blank");
+
+      const webdriver = await page.evaluate(() => navigator.webdriver);
+      expect(webdriver).toBeFalsy();
+
+      const plugins = await page.evaluate(() => Array.from(navigator.plugins).length);
+      expect(plugins).toBeGreaterThan(0);
+
+      await browser.close();
+    }, 30_000);
+  }
+);
+
+// ---------------------------------------------------------------------------
+// launchContext / launchPersistentContext unit tests (mock playwright-core)
+// ---------------------------------------------------------------------------
+
+describe("launchContext (unit)", () => {
+  let mockContext: any;
+  let mockBrowser: any;
+  let newContextMock: any;
+  let mockChromium: any;
+  const origEnv = process.env.CLOAKBROWSER_BINARY_PATH;
+
+  beforeEach(() => {
+    process.env.CLOAKBROWSER_BINARY_PATH = "/fake/chrome";
+    const origClose = vi.fn();
+    mockContext = { close: origClose, _origClose: origClose };
+    // launch() wraps browser.newContext (no-viewport default), so keep the
+    // original mock to read its calls.
+    newContextMock = vi.fn().mockResolvedValue(mockContext);
+    mockBrowser = {
+      newContext: newContextMock,
+      newPage: vi.fn(),
+      close: vi.fn(),
+    };
+    mockChromium = { launch: vi.fn().mockResolvedValue(mockBrowser) };
+
+    vi.doMock("playwright-core", () => ({ chromium: mockChromium }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.resetModules();
+    if (origEnv) {
+      process.env.CLOAKBROWSER_BINARY_PATH = origEnv;
+    } else {
+      delete process.env.CLOAKBROWSER_BINARY_PATH;
+    }
+  });
+
+  it("guards the first launch whose key the no-key menu just created", async () => {
+    // No key before launch; ensureBinary's claim menu saves one. The license
+    // status file must still reach the browser (decided after ensureBinary).
+    delete process.env.CLOAKBROWSER_BINARY_PATH;
+    const origKey = process.env.CLOAKBROWSER_LICENSE_KEY;
+    delete process.env.CLOAKBROWSER_LICENSE_KEY;
+    const ensureBinary = vi.fn().mockImplementation(async () => {
+      process.env.CLOAKBROWSER_LICENSE_KEY = "cb_from_menu";
+      return "/fake/chrome";
+    });
+    vi.doMock("../src/download.js", () => ({ ensureBinary }));
+    try {
+      const { launch } = await import("../src/playwright.js");
+      await launch();
+      const env = mockChromium.launch.mock.calls[0][0].env;
+      expect(env.CLOAKBROWSER_LICENSE_STATUS_FILE).toMatch(/denials/);
+    } finally {
+      vi.doUnmock("../src/download.js");
+      if (origKey === undefined) delete process.env.CLOAKBROWSER_LICENSE_KEY;
+      else process.env.CLOAKBROWSER_LICENSE_KEY = origKey;
+    }
+  });
+
+  it("uses no emulated viewport when none given (headless too)", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    await launchContext();
+
+    const ctxArgs = newContextMock.mock.calls[0][0];
+    expect(ctxArgs.viewport).toBeNull();
+  });
+
+  it("uses custom viewport when provided", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    const custom = { width: 1280, height: 720 };
+    await launchContext({ viewport: custom });
+
+    const ctxArgs = newContextMock.mock.calls[0][0];
+    expect(ctxArgs.viewport).toEqual(custom);
+  });
+
+  it("forwards userAgent to newContext", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    await launchContext({ userAgent: "Custom/1.0" });
+
+    const ctxArgs = newContextMock.mock.calls[0][0];
+    expect(ctxArgs.userAgent).toBe("Custom/1.0");
+  });
+
+  it("passes timezone via binary flag, not CDP context", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    await launchContext({ timezone: "America/New_York" });
+
+    // launch() called with --fingerprint-timezone binary flag
+    const launchArgs = mockChromium.launch.mock.calls[0][0];
+    const hasTimezoneFlag = launchArgs.args.some((a: string) =>
+      a.startsWith("--fingerprint-timezone=America/New_York")
+    );
+    expect(hasTimezoneFlag).toBe(true);
+
+    // NOT in newContext() — no CDP emulation
+    const ctxArgs = newContextMock.mock.calls[0][0];
+    expect(ctxArgs.timezoneId).toBeUndefined();
+  });
+
+  it("forwards colorScheme to newContext", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    await launchContext({ colorScheme: "dark" });
+
+    const ctxArgs = newContextMock.mock.calls[0][0];
+    expect(ctxArgs.colorScheme).toBe("dark");
+  });
+
+  it("close() also closes browser", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    const ctx = await launchContext();
+
+    await ctx.close();
+    // Original context close called
+    expect(mockContext._origClose).toHaveBeenCalledOnce();
+    // Browser also closed
+    expect(mockBrowser.close).toHaveBeenCalledOnce();
+  });
+
+  it("close({ reason }) forwards options to the original close", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    const ctx = await launchContext();
+
+    await ctx.close({ reason: "shutting down" });
+    expect(mockContext._origClose).toHaveBeenCalledWith({ reason: "shutting down" });
+    expect(mockBrowser.close).toHaveBeenCalledOnce();
+  });
+
+  it("close() still closes browser when the context close throws", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    const ctx = await launchContext();
+    mockContext._origClose.mockRejectedValueOnce(new Error("boom"));
+
+    await expect(ctx.close()).rejects.toThrow("boom");
+    expect(mockBrowser.close).toHaveBeenCalledOnce();
+  });
+
+  it("forwards contextOptions to newContext (storageState, etc.)", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    await launchContext({
+      contextOptions: {
+        storageState: "state.json",
+        permissions: ["geolocation"],
+      },
+    });
+
+    const ctxArgs = newContextMock.mock.calls[0][0];
+    expect(ctxArgs.storageState).toBe("state.json");
+    expect(ctxArgs.permissions).toEqual(["geolocation"]);
+  });
+
+  it("explicit top-level fields win over contextOptions on collision", async () => {
+    const { launchContext } = await import("../src/playwright.js");
+    await launchContext({
+      userAgent: "Explicit/1.0",
+      viewport: { width: 1280, height: 720 },
+      colorScheme: "dark",
+      contextOptions: {
+        userAgent: "ShouldBeOverridden/9.9",
+        viewport: { width: 9999, height: 9999 },
+        colorScheme: "light",
+      },
+    });
+
+    const ctxArgs = newContextMock.mock.calls[0][0];
+    expect(ctxArgs.userAgent).toBe("Explicit/1.0");
+    expect(ctxArgs.viewport).toEqual({ width: 1280, height: 720 });
+    expect(ctxArgs.colorScheme).toBe("dark");
+  });
+
+  it("strips locale and timezoneId from contextOptions (stealth-sensitive)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { launchContext } = await import("../src/playwright.js");
+    await launchContext({
+      contextOptions: {
+        storageState: "state.json",
+        locale: "de-DE",
+        timezoneId: "Europe/Berlin",
+      },
+    });
+
+    const ctxArgs = newContextMock.mock.calls[0][0];
+    // Stealth-sensitive keys stripped — they would reintroduce detectable CDP emulation.
+    expect(ctxArgs.locale).toBeUndefined();
+    expect(ctxArgs.timezoneId).toBeUndefined();
+    // Benign keys preserved
+    expect(ctxArgs.storageState).toBe("state.json");
+    // Warning was logged for both stripped keys
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("warns once when the request client is used with a --proxy-server proxy (#579)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { req, inner } = mockRequestClient();
+    mockContext.request = req;
+    const { launchContext } = await import("../src/playwright.js");
+    const ctx: any = await launchContext({ proxy: "socks5://u:p@h:1080" });
+
+    expect(requestProxyWarnings(warnSpy)).toBe(0); // nothing until first use
+    await ctx.request._innerFetch({});
+    await ctx.request._innerFetch({});
+    expect(inner).toHaveBeenCalledTimes(2);
+    expect(requestProxyWarnings(warnSpy)).toBe(1);
+  });
+
+  it("no request client warning when Playwright owns the proxy (#579)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { req, inner } = mockRequestClient();
+    mockContext.request = req;
+    const { launchContext } = await import("../src/playwright.js");
+    const ctx: any = await launchContext({ proxy: "http://h:8080" });
+
+    await ctx.request._innerFetch({});
+    expect(inner).toHaveBeenCalledOnce();
+    expect(requestProxyWarnings(warnSpy)).toBe(0);
+  });
+
+  it("no request client warning when the context has its own proxy (#579)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { req } = mockRequestClient();
+    mockContext.request = req;
+    mockContext._options = { proxy: { server: "http://ctx-proxy:8080" } };
+    const { launchContext } = await import("../src/playwright.js");
+    const ctx: any = await launchContext({ proxy: "socks5://u:p@h:1080" });
+
+    await ctx.request._innerFetch({});
+    expect(requestProxyWarnings(warnSpy)).toBe(0);
+  });
+});
+
+/** Request client whose _innerFetch lives on the prototype, like playwright-core's. */
+function mockRequestClient() {
+  const proto = { _innerFetch: vi.fn().mockResolvedValue("ok") };
+  return { req: Object.create(proto), inner: proto._innerFetch };
+}
+
+function requestProxyWarnings(warnSpy: { mock: { calls: unknown[][] } }): number {
+  return warnSpy.mock.calls.filter((c) => String(c[0]).includes("context.request")).length;
+}
+
+describe("launchPersistentContext (unit)", () => {
+  let mockContext: any;
+  let mockChromium: any;
+  const origEnv = process.env.CLOAKBROWSER_BINARY_PATH;
+
+  beforeEach(() => {
+    process.env.CLOAKBROWSER_BINARY_PATH = "/fake/chrome";
+    mockContext = { close: vi.fn(), pages: vi.fn().mockReturnValue([]) };
+    mockChromium = {
+      launchPersistentContext: vi.fn().mockResolvedValue(mockContext),
+    };
+
+    vi.doMock("playwright-core", () => ({ chromium: mockChromium }));
+    // Fixed fake profile paths: keep the seed file off disk (covered in profile-seed.test.ts).
+    vi.doMock("../src/profile-seed.js", () => ({ persistentSeedArgs: (_d: any, _s: any, a: any) => a }));
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.resetModules();
+    if (origEnv) {
+      process.env.CLOAKBROWSER_BINARY_PATH = origEnv;
+    } else {
+      delete process.env.CLOAKBROWSER_BINARY_PATH;
+    }
+  });
+
+  it("warns once when the request client is used with a --proxy-server proxy (#579)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { req, inner } = mockRequestClient();
+    mockContext.request = req;
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    const ctx: any = await launchPersistentContext({ userDataDir: "/tmp/profile", proxy: "socks5://u:p@h:1080" });
+
+    await ctx.request._innerFetch({});
+    await ctx.request._innerFetch({});
+    expect(inner).toHaveBeenCalledTimes(2);
+    expect(requestProxyWarnings(warnSpy)).toBe(1);
+  });
+
+  it("no request client warning when Playwright owns the proxy (#579)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { req } = mockRequestClient();
+    mockContext.request = req;
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    const ctx: any = await launchPersistentContext({ userDataDir: "/tmp/profile", proxy: "http://h:8080" });
+
+    await ctx.request._innerFetch({});
+    expect(requestProxyWarnings(warnSpy)).toBe(0);
+  });
+
+  it("uses no emulated viewport by default (headless too)", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({ userDataDir: "/tmp/profile" });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.viewport).toBeNull();
+  });
+
+  it("passes timezone and locale via binary args, not CDP context", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      timezone: "Asia/Tokyo",
+      locale: "ja-JP",
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    // Binary args (native, undetectable)
+    expect(args.args).toContain("--fingerprint-timezone=Asia/Tokyo");
+    expect(args.args).toContain("--lang=ja-JP");
+    // NOT in context kwargs (would trigger detectable CDP emulation)
+    expect(args.timezoneId).toBeUndefined();
+    expect(args.locale).toBeUndefined();
+  });
+
+  it("forwards a credentialed proxy string inline via --proxy-server", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      proxy: "http://user:pass@proxy:8080",
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.proxy).toBeUndefined();
+    expect(args.args).toContain("--proxy-server=http://user:pass@proxy:8080");
+  });
+
+  it("forwards userAgent and colorScheme", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      userAgent: "Custom/1.0",
+      colorScheme: "dark",
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.userAgent).toBe("Custom/1.0");
+    expect(args.colorScheme).toBe("dark");
+  });
+
+  it("forwards contextOptions to launchPersistentContext", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      contextOptions: {
+        permissions: ["geolocation"],
+        extraHTTPHeaders: { "X-Custom": "1" },
+      },
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.permissions).toEqual(["geolocation"]);
+    expect(args.extraHTTPHeaders).toEqual({ "X-Custom": "1" });
+  });
+
+  it("explicit top-level fields win over contextOptions in persistent context", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      userAgent: "Explicit/1.0",
+      viewport: { width: 1280, height: 720 },
+      contextOptions: {
+        userAgent: "ShouldBeOverridden/9.9",
+        viewport: { width: 9999, height: 9999 },
+      },
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.userAgent).toBe("Explicit/1.0");
+    expect(args.viewport).toEqual({ width: 1280, height: 720 });
+  });
+
+  it("strips locale and timezoneId from contextOptions (persistent context)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      contextOptions: {
+        locale: "de-DE",
+        timezoneId: "Europe/Berlin",
+      },
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.locale).toBeUndefined();
+    expect(args.timezoneId).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("injects env when licenseKey param provided", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      licenseKey: "cb_persistent",
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.env).toBeDefined();
+    expect(args.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_persistent");
+  });
+
+  it("does not inject env when no license key", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({ userDataDir: "/tmp/profile" });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.env).toBeUndefined();
+  });
+
+  it("preserves custom launchOptions env merged with license key", async () => {
+    const { launchPersistentContext } = await import("../src/playwright.js");
+    await launchPersistentContext({
+      userDataDir: "/tmp/profile",
+      licenseKey: "cb_merge",
+      launchOptions: {
+        env: { MY_VAR: "keep" },
+      },
+    });
+
+    const args = mockChromium.launchPersistentContext.mock.calls[0][1];
+    expect(args.env).toBeDefined();
+    expect(args.env!.CLOAKBROWSER_LICENSE_KEY).toBe("cb_merge");
+    expect(args.env!.MY_VAR).toBe("keep");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// License exit-code surfacing at launch() (mock playwright-core to reject)
+// ---------------------------------------------------------------------------
+
+describe("launch license error surfacing (unit)", () => {
+  const origEnv = process.env.CLOAKBROWSER_BINARY_PATH;
+
+  beforeEach(() => {
+    process.env.CLOAKBROWSER_BINARY_PATH = "/fake/chrome";
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.resetModules();
+    if (origEnv) {
+      process.env.CLOAKBROWSER_BINARY_PATH = origEnv;
+    } else {
+      delete process.env.CLOAKBROWSER_BINARY_PATH;
+    }
+  });
+
+  it("maps a license exit code to CloakBrowserLicenseError", async () => {
+    const licenseErr = new Error(
+      "browserType.launch: Target closed\nBrowser logs:\n- [pid=1] <process did exit: exitCode=77, signal=null>"
+    );
+    vi.doMock("playwright-core", () => ({
+      chromium: { launch: vi.fn().mockRejectedValue(licenseErr) },
+    }));
+    const { launch } = await import("../src/playwright.js");
+    const { CloakBrowserLicenseError } = await import("../src/license.js");
+    await expect(launch()).rejects.toBeInstanceOf(CloakBrowserLicenseError);
+  });
+
+  it("re-throws a non-license launch error unchanged (exact object)", async () => {
+    const other = new Error("some unrelated launch failure");
+    vi.doMock("playwright-core", () => ({
+      chromium: { launch: vi.fn().mockRejectedValue(other) },
+    }));
+    const { launch } = await import("../src/playwright.js");
+    await expect(launch()).rejects.toBe(other);
+  });
+});
